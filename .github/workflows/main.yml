@@ -1,0 +1,24 @@
+name: Build AnthonyPS2
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build AnthonyPS2 (Release x64)
+        run: msbuild Anthony.sln /t:AnthonyPS2 /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnthonyPS2-x64
+          path: |
+            **/Release/AnthonyPS2.exe
+          if-no-files-found: error
