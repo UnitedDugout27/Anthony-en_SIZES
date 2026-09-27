@@ -61,9 +61,13 @@ struct ICON_SYS
 };
 #pragma pack()
 
+#define PS2MC_MAX_CARD_MB 64	// Largest supported card image size in MB (was 8)
+
 union PS2MEMORYCARD
 {
-	byte Byte[8 * 1024 * (1024 + 32)];//[8 * 1024 * (1024+32)];
+	// Buffer sized for the largest supported card: 64MB of page data + ECC (16 bytes per 512-byte page).
+	// 8MB = 8,650,752 bytes / 16MB = 17,301,504 / 32MB = 34,603,008 / 64MB = 69,206,016
+	byte Byte[PS2MC_MAX_CARD_MB * 1024 * (1024 + 32)];
 	MC2 Superblock;
 };
 
