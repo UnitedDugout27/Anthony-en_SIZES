@@ -53,6 +53,10 @@ struct io_dirent {
 int mcio_init(void);
 int mcio_mcDetect(void);
 int mcio_mcGetInfo(int *pagesize, int *blocksize, int *cardsize, int *cardflags);
+int mcio_mcGetRawInfo(int *pagesize, int *blocksize, int *cardsize, int *cardflags);
+int mcio_mcDiagnose(char *out, int outsize);
+int mcio_mcPing(char *out, int outsize);
+void mcio_mcCalcPageEcc(uint8_t *pagebuf, uint8_t *sparebuf, int pagesize);
 int mcio_mcGetAvailableSpace(int *cardfree);
 int mcio_mcOpen(char *filename, int flag);
 int mcio_mcClose(int fd);

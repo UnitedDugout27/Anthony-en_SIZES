@@ -3906,6 +3906,105 @@ int mcio_mcGetInfo(int *pagesize, int *blocksize, int *cardsize, int *cardflags)
 	return 0;
 }
 
+/*
+ * mcio_mcGetRawInfo: get the physical card geometry WITHOUT requiring a valid
+ * PS2 file system. mcio_mcGetInfo() fails on unformatted/corrupted cards, which
+ * made it impossible to dump or rewrite such a card.
+ */
+int mcio_mcGetRawInfo(int *pagesize, int *blocksize, int *cardsize, int *cardflags)
+{
+	struct MCDevInfo *mcdi = (struct MCDevInfo *)&mcio_devinfo;
+
+	/* Always run the full handshake. Card_Probe() skips authentication when the
+	 * card does not report itself as 'changed', which some third-party cards never
+	 * do, leaving them unauthenticated and ignoring all later commands. */
+	CardAuth_Reset();
+	Card_Authentificate();
+	Card_Validate();
+	Card_ClearCache();
+	Card_SetTerminationCode();
+
+	if (Card_SetDeviceSpecs() != sceMcResSucceed)
+		return sceMcResFailDetect;
+
+	uint8_t _cardflags;
+	uint16_t _pagesize, _blocksize;
+	int32_t _cardsize;
+	if (Card_GetSpecs(&_pagesize, &_blocksize, &_cardsize, &_cardflags) != sceMcResSucceed)
+		return sceMcResFailDetect;
+
+	*pagesize = (int)_pagesize;
+	*blocksize = (int)_blocksize;
+	*cardsize = (int)_cardsize * _pagesize;
+	*cardflags = (int)_cardflags;
+
+	mcdi->cardtype = sceMcTypePS2;
+	return 0;
+}
+
+/*
+ * mcio_mcDiagnose: run each step of the card handshake separately and report
+ * the result of every step, to find where communication with a card fails.
+ */
+int mcio_mcDiagnose(char *out, int outsize)
+{
+	int rChanged = Card_Changed();
+	int rReset = CardAuth_Reset();
+	int rAuth = Card_Authentificate();
+	int rValidate = Card_Validate();
+	int rTerm = Card_SetTerminationCode();
+
+	uint8_t flags = 0;
+	uint16_t pagesize = 0, blocksize = 0;
+	int32_t cardsize = 0;
+	int rSpecs = Card_GetSpecs(&pagesize, &blocksize, &cardsize, &flags);
+
+	snprintf(out, outsize,
+		"Changed=%d Reset=%d Auth=%d Validate=%d Term=%d Specs=%d\n"
+		"page=%u block=%u pages=%d flags=0x%02X",
+		rChanged, rReset, rAuth, rValidate, rTerm, rSpecs,
+		(unsigned)pagesize, (unsigned)blocksize, (int)cardsize, (unsigned)flags);
+	return rSpecs;
+}
+
+/*
+ * mcio_mcPing: send one simple command to the card and report what came back.
+ * Returns 0 if the card answered with a valid reply header.
+ */
+int mcio_mcPing(char *out, int outsize)
+{
+	memset((void *)&iodata->mc_data, 0, 4);
+	iodata->mc_data[0] = 0x81;
+	iodata->mc_data[1] = 0x11;
+	iodata->mc_data_len = 4;
+	append_le_uint16((uint8_t *)&iodata->dev_data, 0x42aa);
+	int w = usbd_bulk_write((uint8_t *)iodata, iodata->mc_data_len + USBIO_DATA_HDRLEN);
+	int rd = usbd_bulk_read((uint8_t *)iodata, sizeof(usbio_buf));
+	uint16_t hdr = read_le_uint16((uint8_t *)&iodata->dev_data);
+
+	snprintf(out, outsize,
+		"sent=%d bytes, received=%d bytes, reply=0x%04X, data=%02X %02X %02X %02X",
+		w, rd, (unsigned)hdr,
+		iodata->mc_data[0], iodata->mc_data[1], iodata->mc_data[2], iodata->mc_data[3]);
+
+	if (rd <= 0 || hdr != UINT16_C(0x5a55))
+		return -1;
+	return 0;
+}
+
+/*
+ * mcio_mcCalcPageEcc: compute the spare-area ECC for one page exactly as the
+ * card driver does (3 bytes per 128 data bytes), padding the rest with zeros.
+ */
+void mcio_mcCalcPageEcc(uint8_t *pagebuf, uint8_t *sparebuf, int pagesize)
+{
+	int sparesize = pagesize >> 5;
+	int chunks = pagesize >> 7;
+	memset(sparebuf, 0, sparesize);
+	for (int i = 0; i < chunks; i++)
+		Card_DataChecksum(pagebuf + (i * 128), sparebuf + (i * 3));
+}
+
 int mcio_mcGetAvailableSpace(int *cardfree)
 {
 	register int r;

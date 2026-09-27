@@ -214,6 +214,19 @@ INT_PTR CALLBACK DialogProc(
 	return (INT_PTR)FALSE;
 }
 
+//タイトルバーに現在の処理状況を表示(NULLで元に戻す)
+static void SetStatus(LPCTSTR status)
+{
+	if (status == NULL)
+	{
+		SetWindowText(m_hWnd, szTitle);
+		return;
+	}
+	TCHAR buf[256];
+	_stprintf_s(buf, sizeof(buf) / sizeof(buf[0]), _T("%s - %s"), szTitle, status);
+	SetWindowText(m_hWnd, buf);
+}
+
 DWORD WINAPI ReadorWrite(LPVOID lpParam)
 {
 	HRESULT hResult = CoInitialize(NULL);
@@ -282,9 +295,10 @@ static BOOL ShowFileDialog(IFileDialog** ppDlg, const COMDLG_FILTERSPEC* fileTyp
 	HRESULT hr;
 	if (isSaveDialog)
 	{
+		*ppDlg = NULL;
 		hr = CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ppDlg));
 		TCHAR strBuf[4];
-		if (LoadString(hInst, IDS_DEFAULTEXTENSION, strBuf, sizeof(strBuf) / sizeof(strBuf[0])))
+		if (SUCCEEDED(hr) && *ppDlg != NULL && LoadString(hInst, IDS_DEFAULTEXTENSION, strBuf, sizeof(strBuf) / sizeof(strBuf[0])))
 		{
 			//save時に付加するデフォルト拡張子
 			(*ppDlg)->SetDefaultExtension(strBuf);
@@ -295,7 +309,7 @@ static BOOL ShowFileDialog(IFileDialog** ppDlg, const COMDLG_FILTERSPEC* fileTyp
 		hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(ppDlg));
 	}
 
-	if (FAILED(hr)) {
+	if (FAILED(hr) || *ppDlg == NULL) {
 		MessageBox(m_hWnd, L"Failed to create file dialog", szTitle, MB_OK);
 		return FALSE;
 	}
@@ -368,8 +382,24 @@ BOOL ReadFromFile()
 		HANDLE hFile = CreateFile(pwszFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
 		if (hFile != INVALID_HANDLE_VALUE)
 		{
+			LARGE_INTEGER liFileSize = { 0 };
+			if (!GetFileSizeEx(hFile, &liFileSize) || liFileSize.QuadPart > (LONGLONG)sizeof(byteMemDat))
+			{
+				//バッファ(最大64MB+ECC)より大きいファイルは読まない
+				TCHAR strBuf[512] = { 0 };
+				LoadString(hInst, IDS_NOTSUPPORTOVER8MB, strBuf, sizeof(strBuf) / sizeof(strBuf[0]));
+				MessageBox(m_hWnd, strBuf, szTitle, MB_OK);
+				CloseHandle(hFile);
+				CoTaskMemFree(pwszFilePath);
+				pDlg->Release();
+				return FALSE;
+			}
+
+			//前回読み込んだ大きいカードのデータが残らないようにクリア
+			ZeroMemory(&byteMemDat, sizeof(byteMemDat));
+
 			DWORD BytesRead;
-			BOOL b = ReadFile(hFile, byteMemDat.Byte, sizeof(byteMemDat), &BytesRead, NULL);
+			BOOL b = ReadFile(hFile, byteMemDat.Byte, (DWORD)liFileSize.QuadPart, &BytesRead, NULL);
 			if (b && BytesRead > 0)
 			{
 				CloseHandle(hFile);
@@ -401,10 +431,22 @@ BOOL ReadFromCard()
 	int r;
 	int pagesize, blocksize, cardsize, cardflags;
 
+	SetStatus(_T("Connecting to adapter..."));
 	r = usbd_attach_device(0, 0);
+	if (r)
+	{
+		//アダプタが見つからない場合は中止し、理由を表示する
+		MessageBox(m_hWnd, _T("Could not connect to the USB memory card adapter.\nCheck it is plugged in and uses the WinUSB driver."), szTitle, MB_OK);
+		usbd_detach_device();
+		SetStatus(NULL);
+		return FALSE;
+	}
+	SetStatus(_T("Detecting card..."));
 	r = mcio_init();
 
-	r = mcio_mcGetInfo(&pagesize, &blocksize, &cardsize, &cardflags);
+	//未フォーマット/破損カードも読めるように、ファイルシステムを必要としない関数を使う
+	r = mcio_mcGetRawInfo(&pagesize, &blocksize, &cardsize, &cardflags);
+	SetStatus(NULL);
 
 	if (!r)
 	{
@@ -413,7 +455,7 @@ BOOL ReadFromCard()
 		//プログレスバー更新
 		SetProgressBar(pages);
 
-		//8MB以上だったら読まない
+		//64MB以上だったら読まない
 		if (((unsigned long long)pages * ((unsigned long long)pagesize + eccsize)) > sizeof(byteMemDat))
 		{
 			res = FALSE;
@@ -425,6 +467,7 @@ BOOL ReadFromCard()
 		}
 		else
 		{
+			ZeroMemory(&byteMemDat, sizeof(byteMemDat));	//前回のデータをクリア
 			for (int i = 0; i < pages; i++)
 			{
 				byte* pagebuf = &(byteMemDat.Byte[i * (pagesize + eccsize)]);
@@ -460,9 +503,15 @@ BOOL ReadFromCard()
 	else
 	{
 		TCHAR strBuf[128];
+		TCHAR strBuf2[512];
 		if (LoadString(hInst, IDS_ERROR_CARDINFO, strBuf, sizeof(strBuf) / sizeof(strBuf[0])))
 		{
-			MessageBox(m_hWnd, strBuf, szTitle, MB_OK);
+			//各ステップの結果を表示して、どこで失敗しているか分かるようにする
+			char diag[256] = { 0 };
+			mcio_mcDiagnose(diag, sizeof(diag));
+			CA2T tdiag(diag);
+			_stprintf_s(strBuf2, sizeof(strBuf2) / sizeof(strBuf2[0]), _T("%s (code %d)\nThe adapter was found, but the memory card did not respond.\n\n%s"), strBuf, r, (LPCTSTR)tdiag);
+			MessageBox(m_hWnd, strBuf2, szTitle, MB_OK);
 		}
 	}
 	r = usbd_detach_device();
@@ -498,7 +547,7 @@ BOOL WriteToFile()
 				int srcblocksize = srcpagesize * byteMemDat.Superblock.pages_per_block;	//ブロックサイズはpagesize*pages_per_block
 				int srccardsize = srcblocksize * srcblocks;
 
-				//イメージファイルが8MB以上だったら書かない
+				//イメージファイルが64MB以上だったら書かない
 				if (srccardsize <= sizeof(byteMemDat))
 				{
 					DWORD BytesWrite;
@@ -537,6 +586,155 @@ BOOL WriteToFile()
 }
 
 //メモリーカードに書き込む。
+//イメージ内のクラスタからuint32を読む(クラスタは複数ページにまたがる)
+static BOOL ReadClusterU32(uint32_t cluster, uint32_t offset, uint32_t* out)
+{
+	MC2* sb = &byteMemDat.Superblock;
+	uint32_t pl = sb->page_len;
+	uint32_t stride = pl + (pl >> 5);
+	if (cluster >= sb->clusters_per_card || offset + 4 > pl * sb->pages_per_cluster)
+	{
+		return FALSE;
+	}
+	uint64_t page = (uint64_t)cluster * sb->pages_per_cluster + offset / pl;
+	uint64_t pos = page * stride + (offset % pl);
+	if (pos + 4 > sizeof(byteMemDat))
+	{
+		return FALSE;
+	}
+	memcpy(out, &byteMemDat.Byte[pos], 4);
+	return TRUE;
+}
+
+//FATエントリを読む(rはalloc_offsetからの相対クラスタ番号)
+static BOOL ReadFatEntry(uint32_t r, uint32_t* entry)
+{
+	MC2* sb = &byteMemDat.Superblock;
+	uint32_t perCluster = (sb->page_len * sb->pages_per_cluster) / 4;	//1クラスタ内のエントリ数(通常256)
+	if (perCluster == 0)
+	{
+		return FALSE;
+	}
+	uint32_t fatIndex = r / perCluster;
+	uint32_t indIndex = fatIndex / perCluster;
+	if (indIndex >= 32)
+	{
+		return FALSE;
+	}
+	uint32_t fatCluster;
+	if (!ReadClusterU32(sb->ifc_list[indIndex], (fatIndex % perCluster) * 4, &fatCluster))
+	{
+		return FALSE;
+	}
+	return ReadClusterU32(fatCluster, (r % perCluster) * 4, entry);
+}
+
+static BOOL IsErasedPage(const byte* p, uint32_t len)
+{
+	byte first = p[0];
+	if (first != 0xFF && first != 0x00)
+	{
+		return FALSE;
+	}
+	for (uint32_t i = 1; i < len; i++)
+	{
+		if (p[i] != first)
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+//イメージのブロック構成(1ブロックのページ数)を書き込み先カードに合わせて変換する。
+//PS2がそのカードをフォーマットした場合と同じ構成にする:
+//スーパーブロックのpages_per_block/バックアップブロック/alloc_end/card_flagsを更新し、
+//新しいバックアップ領域を消去状態にし、全ページのECCを再計算する。
+static BOOL ConvertImageBlockLayout(int newppb, int newflags, TCHAR* err, size_t errlen)
+{
+	MC2* sb = &byteMemDat.Superblock;
+	uint32_t ppc = sb->pages_per_cluster;
+	uint32_t pl = sb->page_len;
+	uint32_t oldppb = sb->pages_per_block;
+	if (ppc == 0 || pl == 0 || oldppb == 0 || newppb <= 0 || (newppb % ppc) != 0)
+	{
+		_stprintf_s(err, errlen, _T("Cannot convert: the image has an unexpected layout."));
+		return FALSE;
+	}
+	uint32_t stride = pl + (pl >> 5);
+	uint32_t totalpages = sb->clusters_per_card * ppc;
+	if ((totalpages % newppb) != 0 || (uint64_t)totalpages * stride > sizeof(byteMemDat))
+	{
+		_stprintf_s(err, errlen, _T("Cannot convert: card size is not a whole number of %d-page blocks."), newppb);
+		return FALSE;
+	}
+	uint32_t newblocks = totalpages / newppb;
+	if (newblocks < 3)
+	{
+		_stprintf_s(err, errlen, _T("Cannot convert: too few blocks."));
+		return FALSE;
+	}
+	uint32_t newb1 = newblocks - 1;
+	uint32_t newb2 = newblocks - 2;
+	uint32_t newstart = (newb2 * newppb) / ppc;	//新しいバックアップ領域の先頭クラスタ(絶対)
+	if (newstart <= sb->alloc_offset)
+	{
+		_stprintf_s(err, errlen, _T("Cannot convert: invalid allocation area."));
+		return FALSE;
+	}
+	uint32_t newend = newstart - sb->alloc_offset;
+	uint32_t oldend = sb->alloc_end;
+
+	//バックアップ領域になるクラスタにセーブデータが無いことを確認
+	for (uint32_t r = newend; r < oldend; r++)
+	{
+		uint32_t entry;
+		if (!ReadFatEntry(r, &entry))
+		{
+			_stprintf_s(err, errlen, _T("Cannot convert: could not read the image's file table (FAT)."));
+			return FALSE;
+		}
+		if (entry & 0x80000000)
+		{
+			_stprintf_s(err, errlen, _T("Cannot convert: save data is stored in the last %u KB of the card image,\nwhich this card needs for its backup area.\nDelete or move a save in PCSX2 to free space, then try again."),
+				(unsigned)((oldend - newend) * pl * ppc / 1024));
+			return FALSE;
+		}
+	}
+
+	//スーパーブロック更新
+	sb->pages_per_block = (uint16_t)newppb;
+	sb->backup_block1 = newb1;
+	sb->backup_block2 = newb2;
+	if (newend < oldend)
+	{
+		sb->alloc_end = newend;
+	}
+	for (int i = 0; i < 32; i++)
+	{
+		if (sb->bad_block_list[i] != 0xFFFFFFFF)
+		{
+			sb->bad_block_list[i] = (uint32_t)(((uint64_t)sb->bad_block_list[i] * oldppb) / newppb);
+		}
+	}
+	sb->card_flags = (byte)newflags;
+
+	//ページごとの処理: 新バックアップ領域と未使用ページは消去状態、それ以外はECC再計算
+	byte eraseByte = (newflags & 0x10) ? 0x00 : 0xFF;
+	uint32_t backupFirstPage = newb2 * newppb;
+	for (uint32_t pg = 0; pg < totalpages; pg++)
+	{
+		byte* d = &byteMemDat.Byte[(uint64_t)pg * stride];
+		if (pg >= backupFirstPage || IsErasedPage(d, stride))
+		{
+			memset(d, eraseByte, stride);
+			continue;
+		}
+		mcio_mcCalcPageEcc(d, d + pl, (int)pl);
+	}
+	return TRUE;
+}
+
 BOOL WriteToCard()
 {
 	//確認メッセージ
@@ -570,7 +768,7 @@ BOOL WriteToCard()
 
 	if (!r)
 	{
-		TCHAR strBuf[128] = { 0 };	//メッセージ表示用
+		TCHAR strBuf[512] = { 0 };	//メッセージ表示用
 
 		mcio_init();	//返り値は無視
 
@@ -584,17 +782,48 @@ BOOL WriteToCard()
 		int srcblocksize = srcpagesize * byteMemDat.Superblock.pages_per_block;	//ブロックサイズはpagesize*pages_per_block
 		int srccardsize = srcblocksize * srcblocks;
 
-		//イメージファイルが8MB以上だったら書かない
+		//イメージファイルが64MB以上だったら書かない
 		if (srccardsize <= sizeof(byteMemDat))
 		{
 			//書き込む先のカード情報取得
 			int dstpagesize, dstblocksize, dstcardsize, dstcardflags;
-			r = mcio_mcGetInfo(&dstpagesize, &dstblocksize, &dstcardsize, &dstcardflags);
+			r = mcio_mcGetRawInfo(&dstpagesize, &dstblocksize, &dstcardsize, &dstcardflags);
 
-			if (!r)
+			//サイズは同じでブロックのページ数だけ違う場合は、カードに合わせて変換するか確認
+			if (!r && (byteMemDat.Superblock.page_len * srcpages) == dstcardsize
+				&& dstpagesize == byteMemDat.Superblock.page_len
+				&& dstblocksize != byteMemDat.Superblock.pages_per_block)
+			{
+				TCHAR ask[512];
+				_stprintf_s(ask, sizeof(ask) / sizeof(ask[0]),
+					_T("This card uses %d-page blocks, but the image uses %d-page blocks.\n\n")
+					_T("Convert the image to match the card before writing?\n")
+					_T("(Your .ps2 file on disk is not changed. Use 'to File' afterwards if you want to save the converted copy.)"),
+					dstblocksize, (int)byteMemDat.Superblock.pages_per_block);
+				if (MessageBox(m_hWnd, ask, szTitle, MB_YESNO | MB_ICONQUESTION) == IDYES)
+				{
+					SetStatus(_T("Converting image..."));
+					if (ConvertImageBlockLayout(dstblocksize, dstcardflags, strBuf, sizeof(strBuf) / sizeof(strBuf[0])))
+					{
+						srcblocks = srcpages / byteMemDat.Superblock.pages_per_block;
+						srcblocksize = srcpagesize * byteMemDat.Superblock.pages_per_block;
+						srccardsize = srcblocksize * srcblocks;
+						SetProgressBar(srcblocks);
+					}
+					else
+					{
+						res = FALSE;	//strBufに理由が入っている
+					}
+					SetStatus(NULL);
+				}
+			}
+
+			if (!r && res)
 			{
 				//イメージファイルのページサイズ(ecc抜き)*ページ数と書き込み先サイズが合わなかったら書かない
-				if ((byteMemDat.Superblock.page_len * srcpages) == dstcardsize)
+				if ((byteMemDat.Superblock.page_len * srcpages) == dstcardsize
+					&& dstpagesize == byteMemDat.Superblock.page_len
+					&& dstblocksize == byteMemDat.Superblock.pages_per_block)	//ページ/ブロック構成も一致すること
 				{
 					//書き込み処理
 					uint8_t** pagebufarray = (uint8_t**)malloc(sizeof(uint8_t*) * byteMemDat.Superblock.pages_per_block);	//バッファ配列
@@ -609,8 +838,37 @@ BOOL WriteToCard()
 								eccbufarray[p] = &(byteMemDat.Byte[(i * srcblocksize) + (p * srcpagesize) + byteMemDat.Superblock.page_len]);	//ECCバッファはページデータに続いた場所にある
 							}
 
-							//書き込みはブロック単位
-							int r = mcio_mcWriteBlock(i, pagebufarray, eccbufarray);
+							//書き込みはブロック単位。書き込み後に読み戻して検証し、失敗したら1回だけ再試行
+							int r = 0;
+							BOOL verified = FALSE;
+							for (int attempt = 0; attempt < 2 && !verified; attempt++)
+							{
+								r = mcio_mcWriteBlock(i, pagebufarray, eccbufarray);
+								if (r)
+								{
+									continue;
+								}
+								verified = TRUE;
+								for (int p = 0; p < byteMemDat.Superblock.pages_per_block; p++)
+								{
+									static uint8_t verifypage[1024];
+									static uint8_t verifyecc[64];
+									int pagenum = i * byteMemDat.Superblock.pages_per_block + p;
+									if (mcio_mcReadPageWithEcc(pagenum, verifypage, verifyecc) != 0
+										|| memcmp(verifypage, pagebufarray[p], byteMemDat.Superblock.page_len) != 0)
+									{
+										verified = FALSE;
+										break;
+									}
+								}
+							}
+							if (!r && !verified)
+							{
+								res = FALSE;
+								_stprintf_s(strBuf, sizeof(strBuf) / sizeof(strBuf[0]),
+									_T("Verify failed at block %d of %d.\nThe data read back from the card did not match the file."), i, srcblocks);
+								break;
+							}
 							if (r)
 							{
 								//失敗したときの処理
@@ -637,14 +895,21 @@ BOOL WriteToCard()
 				else
 				{
 					res = FALSE;
-					LoadString(hInst, IDS_NOTMATCH_CARDSIZE, strBuf, sizeof(strBuf) / sizeof(strBuf[0]));
+					//どこが合わないのか分かるように、ファイルとカードの値を表示
+					_stprintf_s(strBuf, sizeof(strBuf) / sizeof(strBuf[0]),
+						_T("Not Match CardSize between ImageFile and Memory Card.\n\n")
+						_T("File: %d bytes, page %d bytes, block %d pages\n")
+						_T("Card: %d bytes, page %d bytes, block %d pages, flags 0x%02X"),
+						(int)(byteMemDat.Superblock.page_len * srcpages), (int)byteMemDat.Superblock.page_len, (int)byteMemDat.Superblock.pages_per_block,
+						dstcardsize, dstpagesize, dstblocksize, dstcardflags);
 				}
 			}
-			else
+			else if (r)
 			{
 				res = FALSE;
 				LoadString(hInst, IDS_ERROR_TARGETCARDSIZE, strBuf, sizeof(strBuf) / sizeof(strBuf[0]));
 			}
+			//r == 0 && !res の場合は変換失敗。理由は既にstrBufに入っている
 		}
 		else
 		{
@@ -730,12 +995,19 @@ BOOL SetupWinUsb(DEVICE_DATA* deviceData)
 	//	deviceDesc.idProduct,
 	//	deviceDesc.bcdUSB);
 
+	//応答が無いときに永久に待たないよう、転送タイムアウトを設定(ミリ秒)
+	ULONG pipeTimeout = 1000;
+	WinUsb_SetPipePolicy(deviceData->WinusbHandle, 0x81, PIPE_TRANSFER_TIMEOUT, sizeof(pipeTimeout), &pipeTimeout);
+	WinUsb_SetPipePolicy(deviceData->WinusbHandle, 0x02, PIPE_TRANSFER_TIMEOUT, sizeof(pipeTimeout), &pipeTimeout);
+
+	//以下のパイプ列挙は情報取得のみ。結果で接続失敗扱いにしない(以前は正常なアダプタでも失敗になることがあった)
 	WinUsb_QueryInterfaceSettings(deviceData->WinusbHandle, 0, &interfaceDesc);
 
 	for (int i = 0; i < interfaceDesc.bNumEndpoints; i++)
 	{
 		WINUSB_PIPE_INFORMATION pipeInfo;
 		BOOL bResult;
+		ZeroMemory(&pipeInfo, sizeof(pipeInfo));
 
 		//[3]
 		bResult = WinUsb_QueryPipe(deviceData->WinusbHandle,
@@ -761,11 +1033,10 @@ BOOL SetupWinUsb(DEVICE_DATA* deviceData)
 		}
 		else
 		{
-			bResult = FALSE;
 			break;
 		}
 	}
-	return bResult;
+	return TRUE;
 }
 
 //プログレスバーの設定
@@ -799,8 +1070,19 @@ BOOL UpdateDataList(PS2MEMORYCARD* data)
 	ListView_DeleteAllItems(hWnd);
 
 	//クラスタごとにスキャン
-	unsigned short clustersize = data->Superblock.pages_per_cluster * (data->Superblock.page_len + 16);	//16 is spea area
-	for (unsigned short i = 1; i < data->Superblock.clusters_per_card; i++)
+	//32MB/64MBカードはクラスタ数が65536以上になるため、unsigned shortではループが終わらない
+	uint32_t clustersize = (uint32_t)data->Superblock.pages_per_cluster * (data->Superblock.page_len + 16);	//16 is spea area
+	if (clustersize == 0)
+	{
+		return FALSE;
+	}
+	uint32_t maxclusters = (uint32_t)(sizeof(data->Byte) / clustersize);	//バッファ外を読まないように制限
+	uint32_t clusters = data->Superblock.clusters_per_card;
+	if (clusters > maxclusters)
+	{
+		clusters = maxclusters;
+	}
+	for (uint32_t i = 1; i < clusters; i++)
 	{
 		char* buf = (char*)&data->Byte[clustersize * i];
 		//PS2Dで始まったらPS2データ
@@ -810,7 +1092,7 @@ BOOL UpdateDataList(PS2MEMORYCARD* data)
 			char strTitle[sizeof(buf_icon_sys->title_name_of_savegame)];
 			StringCbPrintfA(strTitle, sizeof(buf_icon_sys->title_name_of_savegame), "%s", (buf_icon_sys->title_name_of_savegame));
 			//文字コード変換
-			CA2T tstrTitle(strTitle, 932);
+			CA2T tstrTitle(strTitle);
 			LVITEM lvi = { 0, };
 			lvi.pszText = tstrTitle;
 			lvi.mask = LVIF_TEXT;
@@ -823,7 +1105,7 @@ BOOL UpdateDataList(PS2MEMORYCARD* data)
 			char strTitle[0x5f - 0x03];
 			StringCchCopyA(strTitle, sizeof(strTitle), (char*)&buf[4]);
 			//文字コード変換
-			CA2T tstrTitle(strTitle, 932);
+			CA2T tstrTitle(strTitle);
 
 			LVITEM lvi = { 0, };
 			lvi.pszText = tstrTitle;
@@ -868,7 +1150,7 @@ BOOL UpdateDataListfromCard(PS2MEMORYCARD* data)
 					char strTitle[256];
 					StringCchCopyA(strTitle, sizeof(strTitle) / sizeof(strTitle[0]), dirent.name);
 					//文字コード変換
-					CA2T wstrTitle(strTitle, 932);
+					CA2T wstrTitle(strTitle);
 					LVITEM lvi = { 0, };
 					lvi.pszText = wstrTitle;
 					lvi.mask = LVIF_TEXT;
@@ -908,7 +1190,7 @@ BOOL UpdateDataListfromCard(PS2MEMORYCARD* data)
 										char strTitle[sizeof(buf_icon_sys->title_name_of_savegame)];
 										StringCbPrintfA(strTitle, sizeof(buf_icon_sys->title_name_of_savegame), "%s", (buf_icon_sys->title_name_of_savegame));
 										//文字コード変換
-										CA2T tstrTitle(strTitle, 932);
+										CA2T tstrTitle(strTitle);
 										LVITEM lvi = { 0, };
 										lvi.pszText = tstrTitle;
 										lvi.mask = LVIF_TEXT;
@@ -921,7 +1203,7 @@ BOOL UpdateDataListfromCard(PS2MEMORYCARD* data)
 										char strTitle[0x5f - 0x03];
 										StringCchCopyA(strTitle, sizeof(strTitle), (char*)&buf[4]);
 										//文字コード変換
-										CA2T tstrTitle(strTitle, 932);
+										CA2T tstrTitle(strTitle);
 
 										LVITEM lvi = { 0, };
 										lvi.pszText = tstrTitle;
