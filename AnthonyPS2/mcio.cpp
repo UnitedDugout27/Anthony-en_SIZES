@@ -4034,6 +4034,20 @@ int mcio_mcReadPage(int pagenum, void *buf)
 }
 
 //ReadPage with ECCbuf
+/*
+ * mcio_mcReadPageRaw: read a page and its spare area exactly as stored on the
+ * card, WITHOUT applying ECC correction. Used to verify writes: the image's ECC
+ * bytes may not match its data (harmless on a PS2 when the superblock does not
+ * enable ECC), and applying correction would then alter correctly-written data.
+ */
+int mcio_mcReadPageRaw(int pagenum, void *pagedata, void *sparebuf)
+{
+	for (int retries = 0; retries < 3; retries++) {
+		if (Card_ReadPageData((int32_t)pagenum, (uint8_t *)pagedata, (uint8_t *)sparebuf) == sceMcResSucceed)
+			return 0;
+	}
+	return -1;
+}
 int mcio_mcReadPageWithEcc(int pagenum, void *pagedata, void *eccbuf)
 {
 	return Card_ReadPageWithEcc((int32_t)pagenum, (uint8_t *)pagedata, (uint8_t *)eccbuf);

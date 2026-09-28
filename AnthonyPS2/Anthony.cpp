@@ -854,7 +854,8 @@ BOOL WriteToCard()
 									static uint8_t verifypage[1024];
 									static uint8_t verifyecc[64];
 									int pagenum = i * byteMemDat.Superblock.pages_per_block + p;
-									if (mcio_mcReadPageWithEcc(pagenum, verifypage, verifyecc) != 0
+									//ECC訂正なしで、カードに記録された生データを読んで比較する
+									if (mcio_mcReadPageRaw(pagenum, verifypage, verifyecc) != 0
 										|| memcmp(verifypage, pagebufarray[p], byteMemDat.Superblock.page_len) != 0)
 									{
 										verified = FALSE;
