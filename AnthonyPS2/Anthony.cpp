@@ -622,9 +622,20 @@ static BOOL ReadFatEntry(uint32_t r, uint32_t* entry)
 		return FALSE;
 	}
 	uint32_t fatCluster;
-	if (!ReadClusterU32(sb->ifc_list[indIndex], (fatIndex % perCluster) * 4, &fatCluster))
+	uint32_t ifc = sb->ifc_list[indIndex];
+	if (ifc == 0xFFFFFFFF)
+	{
+		*entry = 0x7FFFFFFF;	//FATが存在しない範囲 = 割り当て不可 = 空き
+		return TRUE;
+	}
+	if (!ReadClusterU32(ifc, (fatIndex % perCluster) * 4, &fatCluster))
 	{
 		return FALSE;
+	}
+	if (fatCluster == 0xFFFFFFFF)
+	{
+		*entry = 0x7FFFFFFF;	//FATクラスタが無い範囲 = 空き
+		return TRUE;
 	}
 	return ReadClusterU32(fatCluster, (r % perCluster) * 4, entry);
 }
@@ -639,6 +650,23 @@ static BOOL IsErasedPage(const byte* p, uint32_t len)
 	for (uint32_t i = 1; i < len; i++)
 	{
 		if (p[i] != first)
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+//イメージ内のクラスタが未使用(全ページ消去状態)か
+static BOOL IsClusterBlank(uint32_t cluster)
+{
+	MC2* sb = &byteMemDat.Superblock;
+	uint32_t pl = sb->page_len;
+	uint32_t stride = pl + (pl >> 5);
+	for (uint32_t k = 0; k < sb->pages_per_cluster; k++)
+	{
+		uint64_t pos = ((uint64_t)cluster * sb->pages_per_cluster + k) * stride;
+		if (pos + stride > sizeof(byteMemDat) || !IsErasedPage(&byteMemDat.Byte[pos], stride))
 		{
 			return FALSE;
 		}
@@ -691,7 +719,15 @@ static BOOL ConvertImageBlockLayout(int newppb, int newflags, TCHAR* err, size_t
 		uint32_t entry;
 		if (!ReadFatEntry(r, &entry))
 		{
-			_stprintf_s(err, errlen, _T("Cannot convert: could not read the image's file table (FAT)."));
+			//FATが読めなくても、そのクラスタが未使用(消去状態)なら問題ない
+			if (IsClusterBlank(sb->alloc_offset + r))
+			{
+				continue;
+			}
+			_stprintf_s(err, errlen,
+				_T("Cannot convert: could not read the image's file table (FAT).\n\n")
+				_T("entry=%u alloc_offset=%u alloc_end=%u clusters=%u ifc0=%u ifc1=%u"),
+				r, sb->alloc_offset, sb->alloc_end, sb->clusters_per_card, sb->ifc_list[0], sb->ifc_list[1]);
 			return FALSE;
 		}
 		if (entry & 0x80000000)
