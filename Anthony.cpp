@@ -7,6 +7,8 @@
 #include "Anthony.h"
 #include "device.h"
 #include "Atlconv.h"
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")	//CommandLineToArgvW
 
 constexpr int MAX_LOADSTRING = 100;
 
@@ -70,9 +72,18 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 
 	//.ps2ファイルをダブルクリック(または「プログラムから開く」)で起動された場合は、
 	//「from File」でそのファイルを選んだのと同じように読み込む
-	if (__argc >= 2 && __wargv != NULL && __wargv[1] != NULL && __wargv[1][0] != L'\0')
+	//(__wargvはビルド設定によって空になることがあるため、コマンドラインを直接解析する)
 	{
-		LoadImageFile(__wargv[1]);
+		int argc = 0;
+		LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+		if (argv != NULL)
+		{
+			if (argc >= 2 && argv[1][0] != L'\0')
+			{
+				LoadImageFile(argv[1]);
+			}
+			LocalFree(argv);
+		}
 	}
 
 	hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_WIN32PROJECT1));
