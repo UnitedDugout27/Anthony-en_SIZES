@@ -7,6 +7,8 @@
 #include "Anthony.h"
 #include "device.h"
 #include "Atlconv.h"
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")	//CommandLineToArgvW
 
 constexpr int MAX_LOADSTRING = 100;
 
@@ -33,6 +35,8 @@ INT_PTR CALLBACK DialogProc(
 DWORD WINAPI ReadorWrite(LPVOID lpParam);
 
 BOOL ReadFromFile();
+BOOL LoadImageFile(LPCWSTR pwszFilePath);
+static void SetStatus(LPCTSTR status);
 BOOL ReadFromCard();
 BOOL WriteToCard();
 BOOL WriteToFile();
@@ -64,6 +68,22 @@ int APIENTRY _tWinMain(_In_ HINSTANCE hInstance,
 	if (!InitInstance(hInstance, nCmdShow))
 	{
 		return FALSE;
+	}
+
+	//.ps2ファイルをダブルクリック(または「プログラムから開く」)で起動された場合は、
+	//「from File」でそのファイルを選んだのと同じように読み込む
+	//(__wargvはビルド設定によって空になることがあるため、コマンドラインを直接解析する)
+	{
+		int argc = 0;
+		LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+		if (argv != NULL)
+		{
+			if (argc >= 2 && argv[1][0] != L'\0')
+			{
+				LoadImageFile(argv[1]);
+			}
+			LocalFree(argv);
+		}
 	}
 
 	hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_WIN32PROJECT1));
@@ -214,16 +234,24 @@ INT_PTR CALLBACK DialogProc(
 	return (INT_PTR)FALSE;
 }
 
+//読み込んだファイル名(タイトルバー表示用)
+static TCHAR g_loadedName[MAX_PATH] = { 0 };
+
 //タイトルバーに現在の処理状況を表示(NULLで元に戻す)
 static void SetStatus(LPCTSTR status)
 {
+	TCHAR base[MAX_PATH + MAX_LOADSTRING + 8];
+	if (g_loadedName[0])
+		_stprintf_s(base, sizeof(base) / sizeof(base[0]), _T("%s - %s"), szTitle, g_loadedName);
+	else
+		_tcscpy_s(base, sizeof(base) / sizeof(base[0]), szTitle);
 	if (status == NULL)
 	{
-		SetWindowText(m_hWnd, szTitle);
+		SetWindowText(m_hWnd, base);
 		return;
 	}
-	TCHAR buf[256];
-	_stprintf_s(buf, sizeof(buf) / sizeof(buf[0]), _T("%s - %s"), szTitle, status);
+	TCHAR buf[MAX_PATH + 512];
+	_stprintf_s(buf, sizeof(buf) / sizeof(buf[0]), _T("%s - %s"), base, status);
 	SetWindowText(m_hWnd, buf);
 }
 
@@ -363,6 +391,52 @@ static BOOL GetFilePathFromDialog(IFileDialog* pDlg, LPOLESTR* pwszFilePath)
 	return FALSE;
 }
 
+//指定されたパスの.ps2イメージを読み込む(「from File」とダブルクリック起動の共通処理)
+BOOL LoadImageFile(LPCWSTR pwszFilePath)
+{
+	HANDLE hFile = CreateFile(pwszFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		DWORD dwError = GetLastError();
+		TCHAR szError[MAX_PATH + 128];
+		_stprintf_s(szError, sizeof(szError) / sizeof(szError[0]), L"Failed to open file:\n%s\n\nError code: %d", pwszFilePath, dwError);
+		MessageBox(m_hWnd, szError, szTitle, MB_OK);
+		return FALSE;
+	}
+
+	LARGE_INTEGER liFileSize = { 0 };
+	if (!GetFileSizeEx(hFile, &liFileSize) || liFileSize.QuadPart > (LONGLONG)sizeof(byteMemDat))
+	{
+		//バッファ(最大64MB+ECC)より大きいファイルは読まない
+		TCHAR strBuf[512] = { 0 };
+		LoadString(hInst, IDS_NOTSUPPORTOVER8MB, strBuf, sizeof(strBuf) / sizeof(strBuf[0]));
+		MessageBox(m_hWnd, strBuf, szTitle, MB_OK);
+		CloseHandle(hFile);
+		return FALSE;
+	}
+
+	//前回読み込んだ大きいカードのデータが残らないようにクリア
+	ZeroMemory(&byteMemDat, sizeof(byteMemDat));
+
+	DWORD BytesRead;
+	BOOL b = ReadFile(hFile, byteMemDat.Byte, (DWORD)liFileSize.QuadPart, &BytesRead, NULL);
+	CloseHandle(hFile);
+	if (!b || BytesRead == 0)
+	{
+		MessageBox(m_hWnd, L"Failed to read file", szTitle, MB_OK);
+		return FALSE;
+	}
+
+	UpdateDataList(&byteMemDat);
+
+	//タイトルバーにファイル名を表示
+	LPCWSTR name = wcsrchr(pwszFilePath, L'\\');
+	name = name ? name + 1 : pwszFilePath;
+	wcsncpy_s(g_loadedName, MAX_PATH, name, _TRUNCATE);
+	SetStatus(NULL);
+	return TRUE;
+}
+
 BOOL ReadFromFile()
 {
 	IFileOpenDialog* pDlg = NULL;
@@ -377,51 +451,14 @@ BOOL ReadFromFile()
 	}
 
 	LPOLESTR pwszFilePath = NULL;
+	BOOL res = FALSE;
 	if (GetFilePathFromDialog(pDlg, &pwszFilePath))
 	{
-		HANDLE hFile = CreateFile(pwszFilePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-		if (hFile != INVALID_HANDLE_VALUE)
-		{
-			LARGE_INTEGER liFileSize = { 0 };
-			if (!GetFileSizeEx(hFile, &liFileSize) || liFileSize.QuadPart > (LONGLONG)sizeof(byteMemDat))
-			{
-				//バッファ(最大64MB+ECC)より大きいファイルは読まない
-				TCHAR strBuf[512] = { 0 };
-				LoadString(hInst, IDS_NOTSUPPORTOVER8MB, strBuf, sizeof(strBuf) / sizeof(strBuf[0]));
-				MessageBox(m_hWnd, strBuf, szTitle, MB_OK);
-				CloseHandle(hFile);
-				CoTaskMemFree(pwszFilePath);
-				pDlg->Release();
-				return FALSE;
-			}
-
-			//前回読み込んだ大きいカードのデータが残らないようにクリア
-			ZeroMemory(&byteMemDat, sizeof(byteMemDat));
-
-			DWORD BytesRead;
-			BOOL b = ReadFile(hFile, byteMemDat.Byte, (DWORD)liFileSize.QuadPart, &BytesRead, NULL);
-			if (b && BytesRead > 0)
-			{
-				CloseHandle(hFile);
-				UpdateDataList(&byteMemDat);
-			}
-			else
-			{
-				MessageBox(m_hWnd, L"Failed to read file", szTitle, MB_OK);
-				CloseHandle(hFile);
-			}
-		}
-		else
-		{
-			DWORD dwError = GetLastError();
-			TCHAR szError[256];
-			_stprintf_s(szError, sizeof(szError) / sizeof(szError[0]), L"Failed to open file. Error code: %d", dwError);
-			MessageBox(m_hWnd, szError, szTitle, MB_OK);
-		}
+		res = LoadImageFile(pwszFilePath);
 		CoTaskMemFree(pwszFilePath);
 	}
 	pDlg->Release();
-	return TRUE;
+	return res;
 }
 
 //PS2メモリーカードから読み込む。
